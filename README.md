@@ -1,2 +1,2 @@
-# PCGCN
-Contrastive Semi-Supervised Clustering Based on Pairwise Constraint for Identifying Influential Nodes in Complex Networks
+python = 3.9
+torch = 1.13.0
