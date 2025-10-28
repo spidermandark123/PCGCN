@@ -7,60 +7,35 @@ import math
 import random
 import time
 from torch_sparse import index_select, SparseTensor
-import networkx as nx
-import numpy
-import numpy as np
-import torch
-import pandas as pd
 from scipy.optimize import linear_sum_assignment
-import matplotlib
-from torch.utils.checkpoint import checkpoint
-from torch_geometric.loader import NeighborSampler
-from torch_geometric.utils import to_dense_adj, to_torch_coo_tensor, subgraph
 import os
-
-
-from matplotlib import pyplot as plt
 from scipy.sparse import lil_matrix, coo_matrix
 from torch import nn, optim
 from GCNEmbedding import *
-# from GATembedding import *
 from utils import *
-# from torch.nn.functional import cosine_similarity
 from sklearn.cluster import SpectralClustering, KMeans
 from sklearn.metrics import adjusted_rand_score, accuracy_score, jaccard_score, normalized_mutual_info_score
 from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances
-from sklearn.datasets import make_blobs
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.svm import SVC
-from sklearn.linear_model import LogisticRegression
-from scipy.spatial.distance import euclidean
-from scipy.spatial.distance import cdist
 os.environ["OMP_NUM_THREADS"] = "3"
 os.environ['PYDEVD_DISABLE_FILE_VALIDATION'] = '1'
 import os
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-color_red = "\033[1;31m"  # 红色字体
-color_green = "\033[1;32m"  # 绿色字体
-color_reset = "\033[0m"  # 恢复默认颜色
+color_red = "\033[1;31m"
+color_green = "\033[1;32m"
+color_reset = "\033[0m"
 
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 random.seed(args.seed)
 np.random.seed(args.seed)
-torch.manual_seed(args.seed)  # 设置CPU生成随机数的种子，方便下次复现实验结果。
+torch.manual_seed(args.seed)
 torch.cuda.manual_seed(args.seed)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("device:", device)
 
-
-
 num_fea=2
 
-
-
 data = load_data(args.dataset,num_fea)
-# data.x = data.x[:,-1].reshape(-1,1)
 data.to(device)
 
 merged_mask = data.train_mask+data.test_mask
@@ -70,7 +45,6 @@ total_mask = torch.tensor(total_mask).to(device)
 cal_loss_list = []
 kl_time = []
 op_time = []
-
 
 
 
@@ -91,36 +65,18 @@ def clustering_accuracy(y_true, y_pred):
 def KL_loss(graph_emb: torch.Tensor,
                  centers: torch.Tensor,
                  eps: float = 1e-8) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    graph_emb : [N, d]
-    centers   : [K, d]
-    return    : (kl_scalar, p_ij  [N, K])
-    """
-    # 1. 距离矩阵 -> 一次矩阵乘法 + 广播（等价 cdist，但更快）
-    #    ||x-y||^2 = ||x||^2 + ||y||^2 - 2<x,y>
+
     kl_start = time.time()
-    # 1. 距离矩阵 -> 一次矩阵乘法 + 广播（等价 cdist，但更快）
-    #    ||x-y||^2 = ||x||^2 + ||y||^2 - 2<x,y>
-    x2 = graph_emb.square().sum(1, keepdim=True)  # [N,1]
-    y2 = centers.square().sum(1, keepdim=True).t()  # [1,K]
-    xy = graph_emb @ centers.t()  # [N,K]
-    dist_sq = x2 + y2 - 2 * xy  # 无显式开方
-    dist = torch.sqrt(torch.relu(dist_sq) + eps)  # 开方一次
-
-    # 2. 相似度矩阵
-    sim = 1.0 / (1.0 + dist)  # [N,K]
-
-    # 3. 行归一化得到 q_ij
+    x2 = graph_emb.square().sum(1, keepdim=True)
+    y2 = centers.square().sum(1, keepdim=True).t()
+    xy = graph_emb @ centers.t()
+    dist_sq = x2 + y2 - 2 * xy
+    dist = torch.sqrt(torch.relu(dist_sq) + eps)
+    sim = 1.0 / (1.0 + dist)
     q_ij = sim / sim.sum(1, keepdim=True)
-
-    # 4. 列和 f_j
-    f_j = sim.sum(0)  # [K]
-
-    # 5. p_ij（一次广播完成）
-    tmp = q_ij.square() / f_j  # [N,K]
+    f_j = sim.sum(0)
+    tmp = q_ij.square() / f_j
     p_ij = tmp / tmp.sum(1, keepdim=True)
-
-    # 6. KL 散度（log-sum-exp 稳定）
     kl = torch.sum(p_ij * (p_ij + eps).log() - p_ij * (q_ij + eps).log())
     kl_time.append(time.time() - kl_start)
     return kl, p_ij
@@ -182,65 +138,36 @@ def pair_constraint_loss( choose_embedding, constraint_matrix):
     cal_start = time.time()
     constraint_matrix = constraint_matrix.to_torch_sparse_coo_tensor()
     constraint_sparse = constraint_matrix.coalesce().to(device)
-    constraint_dense = constraint_sparse.to_dense()# 必须 coalesce
-    indices = constraint_sparse.indices()  # [2, nnz]
+    constraint_dense = constraint_sparse.to_dense()
+    indices = constraint_sparse.indices()
     values = constraint_sparse.values()
 
-    # choose_embedding = embedding[total_mask]  # [N, F]
     N = choose_embedding.size(0)
 
-    # 1. 只计算“稀疏张量里出现过的行、列”对应的范数
-    row, col = indices[0], indices[1]  # [nnz]
-    diff = choose_embedding[row] - choose_embedding[col]  # [nnz, F]
-    norm_sq = torch.sum(diff ** 2, dim=1)  # [nnz]  L2^2
-
-    # 2. 与非零值加权求和
+    row, col = indices[0], indices[1]
+    diff = choose_embedding[row] - choose_embedding[col]
+    norm_sq = torch.sum(diff ** 2, dim=1)
     constraint_loss = torch.sum(values * norm_sq)
-
-    """
-        显存恒定版本：按 chunk_size 边数分批计算损失并累加
-        embedding: [N, F]  （N 为子图节点数）
-        constraint_matrix: torch.sparse_coo_tensor, shape [N, N], nnz ≈ 8e7
-        return: 标量 tensor，可反向传播
-        """
-
     cal_end = time.time()
     cal_loss_list.append(cal_end-cal_start)
-    # return total_loss
     return constraint_loss
 
 
 
 def Constraint_matrix():
-    """
-    完全向量化构造约束稀疏矩阵，无 Python 层 for-loop。
-
-    参数
-    ----
-    regular_simi_df : pd.DataFrame 或 np.ndarray  (n,n)
-    train_label     : 1-D array-like 长度 n
-    total_node      : set / list / 1-D array  允许建立约束的节点编号
-    constraint_rate : float   控制 top-k/bottom-k 比例
-    device          : torch.device
-
-    返回
-    ----
-    torch.sparse_coo_tensor  (n,n)
-    """
     regular_simi = data.regular_simi
     train_label = data.train_label
     total_node = data.total_node
-
     regular_simi = regular_simi[total_mask]
     sim = regular_simi[:,total_mask]
 
-    #余弦相似性
+
     # x = data.x[merged_mask]
     # cosine_similarity_matrix = cosine_similarity(x.cpu())
     # cosine_similarity_matrix = torch.tensor(cosine_similarity_matrix)
     # sim = cosine_similarity_matrix.to(device)
 
-    ###距离
+
     # x = data.x[merged_mask]
     # distance_matrix = euclidean_distances(x.cpu())
     # distance_matrix = torch.tensor(distance_matrix)
@@ -250,47 +177,39 @@ def Constraint_matrix():
     label = torch.as_tensor(train_label, device=device)
     total_node = torch.as_tensor(list(total_node), device=device)
 
-    # 2. topk / bottom-k 一次性做完
     pos_k = int(n * args.constraint_rate) + 1
     neg_k = int(n * args.constraint_rate)
-    _, topk_idx = sim.topk(pos_k, dim=1, largest=True)    # (n, pos_k)
-    _, bot_idx  = sim.topk(neg_k, dim=1, largest=False)   # (n, neg_k)
+    _, topk_idx = sim.topk(pos_k, dim=1, largest=True)
+    _, bot_idx  = sim.topk(neg_k, dim=1, largest=False)
 
 
 
-    # 3. 去掉自环
     arange_n = torch.arange(n, device=device)[:, None]
-    top_mask = (topk_idx != arange_n)                     # bool (n, pos_k)
+    top_mask = (topk_idx != arange_n)
     bot_mask = (bot_idx  != arange_n)
 
-    # 4. 构造「行-列」坐标
-    row_top = arange_n.expand(-1, pos_k)[top_mask]        # 1-D
+    row_top = arange_n.expand(-1, pos_k)[top_mask]
     col_top = topk_idx[top_mask]
     row_bot = arange_n.expand(-1, neg_k)[bot_mask]
     col_bot = bot_idx[bot_mask]
 
-    # 5. 各种 mask（全部 torch.bool）
     in_total   = torch.isin(torch.arange(n, device=device), total_node)
-    node_mask  = in_total[:, None] & in_total[None, :]    # (n,n)
-    label_eq   = (label[:, None] == label[None, :])       # (n,n)
+    node_mask  = in_total[:, None] & in_total[None, :]
+    label_eq   = (label[:, None] == label[None, :])
 
-    # 6. 稀疏 mask
     top_sparse    = torch.zeros(n, n, dtype=torch.bool, device=device)
     bottom_sparse = torch.zeros(n, n, dtype=torch.bool, device=device)
     top_sparse[row_top, col_top] = True
     bottom_sparse[row_bot, col_bot] = True
 
-    # 7. 合并规则
     mask_pos = label_eq & node_mask
     mask_neg = (~label_eq) & node_mask
     mask_top = (~node_mask) & top_sparse
     mask_bot = (~node_mask) & bottom_sparse
 
 
-
-    # 8. 转成 scipy COO（保证稀疏）
     def to_coo(torch_mask, val):
-        rc = torch_mask.nonzero(as_tuple=False).cpu().numpy()  # (nnz,2)
+        rc = torch_mask.nonzero(as_tuple=False).cpu().numpy()
         return coo_matrix((np.full(rc.shape[0], val, dtype=np.float32),
                           (rc[:, 0], rc[:, 1])),
                           shape=(n, n))
@@ -301,9 +220,7 @@ def Constraint_matrix():
     coo_bot = to_coo(mask_bot, -1)
 
     final_coo = (coo_pos + coo_neg + coo_top + coo_bot).tocoo()
-    # final_coo = ( coo_top + coo_bot).tocoo()
-    # final_coo = (coo_pos + coo_neg).tocoo()
-    # 9. 转回 torch sparse
+
     indices = torch.from_numpy(np.vstack([final_coo.row, final_coo.col])).long().to(device)
     values  = torch.from_numpy(final_coo.data).to(device)
     return torch.sparse_coo_tensor(indices, values, (n, n), device=device)
@@ -327,9 +244,9 @@ if __name__ == '__main__':
     constraint_matrix = Constraint_matrix()
     constraint_matrix = constraint_matrix.coalesce()
     constraint_matrix = SparseTensor.from_edge_index(
-        constraint_matrix.indices(),  # 必须是 LongTensor
-        constraint_matrix.values(),  # 权重/值
-        sparse_sizes= constraint_matrix.shape)  # (N, D)
+        constraint_matrix.indices(),
+        constraint_matrix.values(),
+        sparse_sizes= constraint_matrix.shape)
     constraint_matrix = constraint_matrix.to(device)
     del data.regular_simi
     data.regular_simi = None
@@ -341,20 +258,17 @@ if __name__ == '__main__':
 
     '''################  Feature reconstruction #############'''
     data.x = torch.cat([data.x, data.added_fea[:, -1].view(-1, 1)], dim=-1)
-    # data.x = data.added_fea[:, -1].view(-1, 1).to(torch.float32)
     data_label = data.label.cpu().numpy().astype(int)
     print("fea:", data.x)
     """###############   Initial model ##########"""
     if args.type == "Binary":
-        # model = GATemb(in_channels=1,out_channels=2,hidden_channels=128).to(device)
         model = GCNemb(num_node_features=data.x.shape[1] , output_dim=2, hidden_dim=128, cluster_num=4).to(device)
         optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-        # optimizer = optim.SGD(model.parameters(),lr=args.learning_rate, weight_decay=args.weight_decay)
     print(model)
 
     loss_set = []
 
-    length = data.train_node_number  # 指定长度
+    length = data.train_node_number
     unlabel_mask = torch.ones(length, dtype=torch.bool)
     label_data = data.total_node
     label_data.sort()
@@ -380,11 +294,9 @@ if __name__ == '__main__':
         for i in range(100):
             if mode == 'kmeans':
                 loss, out = train_semi_supervise_clustering_model(data, centriods, constraint_matrix)
-                # loss, out = train_clustering_model(data, topk, bottomk, centriods)
                 kmean_satrt = time.time()
                 k_input = out.detach().cpu().numpy()
                 k_input = k_input[merged_mask]
-                # k_input = k_input[unlabel_mask]
                 kmeans = KMeans(n_clusters=cluster_number)
                 kmeans.fit(k_input)
                 centriods = torch.tensor(kmeans.cluster_centers_).to(device)
